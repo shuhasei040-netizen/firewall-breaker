@@ -1,238 +1,242 @@
 # -*- coding: utf-8 -*-
-"""
-tunnel.py - 壁の向こうへ通す「管」。
-
-2 系統:
-  SSHTunnel : SSH 動的ポートフォワード (paramiko)。
-              どの VPS からも SSH できれば動く。22 が塞がれていても
-              VPS 側で 443 に変えれば(README 参照)通信は 443 番経由。
-  WSTunnel  : TLS 上の WebSocket タンネル (server.py を VPS に置く必要あり)。
-              外部からは通常の HTTPS 通信と区別不能。
-
-共通インターフェース:
-    t = create_tunnel(mode, host, port, ...)
-    t.connect()
-    chan = t.open("example.com", 443)   # socket 風オブジェクト
-    chan.sendall(b"..."); chan.recv(65536); chan.close()
-    t.close()
-"""
-
-import io
-import ssl
-import asyncio
+import socket
+import struct
 import threading
+import urllib.parse
 
-__all__ = ["TunnelError", "create_tunnel", "SSHTunnel", "WSTunnel"]
+SOCKS_PORT_DEFAULT = 10800
+HTTP_PORT_DEFAULT = 10801
+CHUNK = 65536
+IDLE_TIMEOUT = 300  # 5分無通信で切断
 
-
-class TunnelError(Exception):
-    """ユーザー向け(表示してよい)のトンネルエラー。"""
-    pass
-
-
-def create_tunnel(mode, host, port, username="", password="", key_file="",
-                  ssl_verify=False):
-    """mode は 'ssh' か 'ws'。"""
-    if mode == "ssh":
-        return SSHTunnel(host, int(port), username, password, key_file)
-    if mode == "ws":
-        return WSTunnel(host, int(port), ssl_verify=ssl_verify)
-    raise TunnelError(f"不明なモード: {mode}")
-
-
-# ------------------------------------------------------------ SSH 系
-class SSHTunnel:
-    """SSH 動的ポートフォワード。全外出通信がリモート側から張られる。"""
-
-    def __init__(self, host, port, username, password, key_file=""):
-        self.host = host
-        self.port = int(port)
-        self.username = username
-        self.password = password
-        self.key_file = key_file
-        self._client = None
-        self._transport = None
-        self._lock = threading.Lock()
-
-    def _load_key(self):
-        import paramiko
-        with open(self.key_file, "rb") as f:
-            data = f.read()
-        last = None
-        for cls in (paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey):
-            try:
-                return cls.from_private_key(io.BytesIO(data))
-            except Exception as e:
-                last = e
-        raise TunnelError(f"鍵ファイルを読み込めません: {last}")
-
-    def connect(self):
-        import paramiko
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        kw = dict(hostname=self.host, port=self.port, username=self.username,
-                  timeout=20, banner_timeout=30, auth_timeout=30,
-                  allow_agent=False)
-        if self.key_file:
-            kw["pkey"] = self._load_key()
-        else:
-            kw["password"] = self.password
-            kw["look_for_keys"] = False
+def pump(a, b):
+    def copy(x, y):
         try:
-            client.connect(**kw)
-        except TunnelError:
-            raise
-        except Exception as e:
-            raise TunnelError(f"SSH 接続に失敗しました ({self.host}:{self.port}): {e}")
-        self._client = client
-        self._transport = client.get_transport()
-        try:
-            self._transport.set_keepalive(30)  # 放置切断対策
+            x.settimeout(IDLE_TIMEOUT)
+            while True:
+                try:
+                    data = x.recv(CHUNK)
+                    if not data:
+                        break
+                    y.sendall(data)
+                except socket.timeout:
+                    break
+                except Exception:
+                    break
         except Exception:
             pass
+        finally:
+            for p in (x, y):
+                try:
+                    p.close()
+                except Exception:
+                    pass
 
-    def open(self, dst, dport):
-        """リモート経由で dst:dport への TCP 接続を開く。socket 風オブジェクトを返す。"""
-        if self._transport is None or not self._transport.is_active():
-            raise TunnelError("未接続です")
-        with self._lock:
-            try:
-                chan = self._transport.open_channel(
-                    "forwarded", (dst, int(dport)), timeout=30)
-            except Exception as e:
-                raise TunnelError(f"{dst}:{dport} への経路を開けませんでした: {e}")
-        return chan
+    t1 = threading.Thread(target=copy, args=(a, b), daemon=True)
+    t2 = threading.Thread(target=copy, args=(b, a), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
 
-    def close(self):
-        if self._client is not None:
-            try:
-                self._client.close()
-            except Exception:
-                pass
-            self._client = None
-            self._transport = None
+def _split_hostport(s, default_port):
+    s = s.strip()
+    if s.startswith("["):
+        i = s.find("]")
+        if i > 0:
+            host = s[1:i]
+            rest = s[i + 1:]
+            if rest.startswith(":") and rest[1:].isdigit():
+                return host, int(rest[1:])
+    h, sep, p = s.rpartition(":")
+    if sep and p.isdigit():
+        return (h or "::"), int(p)
+    return s, default_port
 
+class ProxyServer:
+    def __init__(self, tunnel, socks_port=SOCKS_PORT_DEFAULT, http_port=HTTP_PORT_DEFAULT, log=print):
+        self.tunnel = tunnel
+        self.socks_port = int(socks_port)
+        self.http_port = int(http_port)
+        self.log = log
+        self._running = False
+        self._sockets = []
+        self._threads = []
 
-# -------------------------------------------- WebSocket(TLS) 系
-class _WSHandle:
-    """WebSocket 接続を socket 風に見せるラッパー (proxy.py の pump() で使う)。"""
-
-    def __init__(self, ws, loop):
-        self._ws = ws
-        self._loop = loop
-        self._closed = False
-
-    def _call(self, coro):
-        if self._closed:
-            raise OSError("接続は既に閉じられています")
-        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return fut.result()
-
-    def recv(self, n=65536):
-        data = self._call(self._ws.recv())
-        if isinstance(data, str):
-            data = data.encode("utf-8", "replace")
-        return bytes(data)
-
-    def sendall(self, data):
-        self._call(self._ws.send(bytes(data)))
-
-    def close(self):
-        if self._closed:
+    def start(self):
+        if self._running:
             return
-        self._closed = True
+        self._running = True
+        started = []
         try:
-            fut = asyncio.run_coroutine_threadsafe(self._ws.close(), self._loop)
-            fut.result(timeout=5)
+            for proto, port in (("SOCKS5", self.socks_port), ("HTTP", self.http_port)):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    s.bind(("127.0.0.1", port))
+                    s.listen(128)
+                except OSError as e:
+                    s.close()
+                    raise RuntimeError(f"{proto} ポート {port} を開けませんでした: {e}")
+                s.settimeout(1.0)
+                started.append(s)
+                t = threading.Thread(target=self._accept_loop, args=(proto, s), daemon=True)
+                t.start()
+                self._threads.append(t)
+                self.log(f"{proto} プロキシ起動: 127.0.0.1:{port}")
         except Exception:
-            pass
-
-
-class WSTunnel:
-    """WebSocket タンネル。通信は TLS 暗号 + 443 番で、外部から見たら
-    普通の「サイトへの HTTPS 通信」として見える。リモートに server.py 必須。"""
-
-    def __init__(self, host, port, ssl_verify=False):
-        self.host = host
-        self.port = int(port) if port else 443
-        self.ssl_verify = ssl_verify
-        self._loop = None
-        self._thread = None
-        self._ready = threading.Event()
-
-    def _ssl_ctx(self):
-        if self.ssl_verify:
-            return ssl.create_default_context()
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        return ctx
-
-    def connect(self):
-        try:
-            import websockets  # noqa: F401
-        except ImportError:
-            raise TunnelError("'websockets' が未導入です。pip install 'websockets>=12'")
-        if self._loop is None:
-            self._loop = asyncio.new_event_loop()
-            self._thread = threading.Thread(target=self._run_loop, daemon=True)
-            self._thread.start()
-            if not self._ready.wait(5):
-                raise TunnelError("ローカルの非同期ループが起動しませんでした")
-
-    def _run_loop(self):
-        asyncio.set_event_loop(self._loop)
-        self._ready.set()
-        self._loop.run_forever()
-
-    def open(self, dst, dport):
-        if self._loop is None:
-            raise TunnelError("未接続です")
-        fut = asyncio.run_coroutine_threadsafe(
-            self._open(dst, int(dport)), self._loop)
-        try:
-            return fut.result(timeout=45)
-        except TunnelError:
+            for s in started:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+            self._running = False
             raise
-        except Exception as e:
-            raise TunnelError(f"{dst}:{dport} へのトンネルを開けませんでした: {e}")
+        self._sockets = started
 
-    async def _open(self, dst, dport):
-        from websockets.asyncio.client import connect
-        uri = f"wss://{self.host}:{self.port}/"
-        try:
-            ws = await connect(uri, ssl=self._ssl_ctx(),
-                               open_timeout=30, close_timeout=5,
-                               max_size=None,
-                               user_agent_header="Mozilla/5.0 (compatible; WBrowser)")
-        except Exception as e:
-            raise TunnelError(f"サーバー {self.host}:{self.port} に接続できません: {e}")
-        try:
-            await ws.send(f"{dst} {dport}".encode("ascii"))
-            resp = await asyncio.wait_for(ws.recv(), 30)
-            if isinstance(resp, (bytes, bytearray)):
-                resp = bytes(resp).decode("utf-8", "replace")
-            if not str(resp).startswith("OK"):
-                raise TunnelError(f"サーバーが拒否しました: {resp}")
-        except TunnelError:
+    def stop(self):
+        self._running = False
+        for s in self._sockets:
             try:
-                await ws.close()
+                s.close()
             except Exception:
                 pass
-            raise
-        except Exception as e:
-            try:
-                await ws.close()
-            except Exception:
-                pass
-            raise TunnelError(f"トンネル確立に失敗しました: {e}")
-        return _WSHandle(ws, self._loop)
+        self._sockets = []
+        for t in self._threads:
+            t.join(timeout=2)
+        self._threads = []
 
-    def close(self):
-        if self._loop is not None:
+    def _accept_loop(self, proto, s):
+        while self._running:
             try:
-                self._loop.call_soon_threadsafe(self._loop.stop)
+                conn, addr = s.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            conn.settimeout(IDLE_TIMEOUT)
+            threading.Thread(target=self._handle, args=(proto, conn, addr), daemon=True).start()
+
+    def _handle(self, proto, conn, addr):
+        try:
+            if proto == "SOCKS5":
+                self._handle_socks5(conn)
+            else:
+                self._handle_http(conn)
+        except Exception:
+            try:
+                conn.close()
             except Exception:
                 pass
-            self._loop = None
-            self._thread = None
+
+    def _handle_socks5(self, conn):
+        def read(n):
+            buf = b""
+            while len(buf) < n:
+                d = conn.recv(n - len(buf))
+                if not d:
+                    raise OSError("クライアント切断")
+                buf += d
+            return buf
+
+        try:
+            ver = read(1)[0]
+            if ver != 5:
+                conn.close()
+                return
+            read(read(1)[0])
+            conn.sendall(b"\x05\x00")
+            ver, cmd, _rsv, atyp = struct.unpack(">BBBH", read(4))
+            
+            if atyp == 1:
+                host = socket.inet_ntop(socket.AF_INET, read(4))
+            elif atyp == 3:
+                host = read(read(1)[0]).decode("utf-8", "replace")
+            elif atyp == 4:
+                host = socket.inet_ntop(socket.AF_INET6, read(16))
+            else:
+                conn.sendall(b"\x05\x08\x00\x01" + b"\x00" * 6)
+                conn.close()
+                return
+            dport = struct.unpack(">H", read(2))[0]
+
+            if cmd != 1:
+                conn.sendall(b"\x05\x07\x00\x01" + b"\x00" * 6)
+                conn.close()
+                return
+
+            remote = self.tunnel.open(host, dport)
+            conn.sendall(b"\x05\x00\x00\x01" + b"\x00" * 4 + struct.pack(">H", 0))
+            self.log(f"SOCKS5 -> {host}:{dport}")
+            pump(conn, remote)
+        except Exception as e:
+            self.log(f"SOCKS5 エラー {e}")
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _handle_http(self, conn):
+        def read_until(sep, limit=262144):
+            buf = b""
+            while sep not in buf:
+                d = conn.recv(65536)
+                if not d:
+                    return None
+                buf += d
+                if len(buf) > limit:
+                    return None
+            return buf
+
+        try:
+            raw = read_until(b"\r\n\r\n")
+            if raw is None:
+                conn.close()
+                return
+            head, _, rest = raw.partition(b"\r\n\r\n")
+            lines = head.split(b"\r\n")
+            req = lines[0].decode("latin-1")
+            parts = req.split(" ")
+            if len(parts) < 3:
+                conn.close()
+                return
+            method, target = parts[0].upper(), parts[1]
+
+            if method == "CONNECT":
+                host, port = _split_hostport(target, 443)
+                remote = self.tunnel.open(host, port)
+                conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                self.log(f"HTTP CONNECT -> {host}:{port}")
+                pump(conn, remote)
+                return
+
+            parsed = urllib.parse.urlsplit(target)
+            if parsed.hostname:
+                host = parsed.hostname
+                port = parsed.port or (443 if parsed.scheme == "https" else 80)
+                new_target = parsed.path or "/"
+                if parsed.query:
+                    new_target += "?" + parsed.query
+            else:
+                host, port = None, 80
+                new_target = target
+                for l in lines[1:]:
+                    if l.lower().startswith(b"host:"):
+                        host, port = _split_hostport(l[5:].decode("latin-1").strip(), 80)
+                        break
+                if host is None:
+                    conn.close()
+                    return
+
+            remote = self.tunnel.open(host, port)
+            new_head = (b" ".join((method.encode("latin-1"), new_target.encode("latin-1"), b"HTTP/1.1"))
+                        + b"\r\n" + b"\r\n".join(lines[1:]) + b"\r\n\r\n")
+            remote.sendall(new_head + rest)
+            self.log(f"HTTP {method} -> {host}:{port}")
+            pump(conn, remote)
+        except Exception as e:
+            self.log(f"HTTP エラー {e}")
+            try:
+                conn.close()
+            except Exception:
+                pass
